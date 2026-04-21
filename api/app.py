@@ -310,6 +310,11 @@ def bulk_orders():
     thread.daemon = True
     thread.start()
     
+    # [REAL-TIME] Invalidate cache immediately to show progress start
+    import api.services as svc
+    from api.services import _snap_lock
+    with _snap_lock: svc._snap_cache = None
+        
     return _ok(f"Bắt đầu bơm siêu tốc {count} đơn hàng (Chạy ngầm)...", data={"status": "started", "count": count})
 
 
@@ -340,6 +345,10 @@ def ops_ingest_historical():
     sql_path = os.path.join(base_dir, "db", "init.sql")
     result = ingest_sql(sql_path)
     if result["status"] == "success":
+        # [REAL-TIME] Invalidate cache
+        import api.services as svc
+        from api.services import _snap_lock
+        with _snap_lock: svc._snap_cache = None
         return _ok(result["message"])
     return _err(result["message"])
 
@@ -353,80 +362,74 @@ def ops_purge_queue():
 
 
 # ─────────────────────────────────────────────────────────────
-#  Service Management API (Docker Compose Bridge)
+#  Service Management API (Docker Compose Bridge - DooD)
 # ─────────────────────────────────────────────────────────────
-@app.route("/api/ops/service-status", methods=["GET"])
-def ops_service_status():
-    """Returns the running status of dockerized services."""
+def run_docker_compose(cmd_list):
+    """Helper to run docker compose commands within the project context."""
     try:
-        # Use absolute path to project root for docker-compose
-        root_dir = os.path.dirname(os.path.dirname(__file__))
-        result = subprocess.run(
-            ["docker-compose", "ps", "--format", "json"],
-            cwd=root_dir, capture_output=True, text=True, check=True
-        )
+        # Intelligent path detection
+        if os.path.exists("/app/docker-compose.yml"):
+            root_dir = "/app"
+        else:
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            
+        compose_file = os.path.join(root_dir, "docker-compose.yml")
         
-        # Parse docker-compose ps --format json (lines of JSON objects in older version or array in newer)
-        raw = result.stdout.strip()
-        if not raw:
-            return _ok("Services Offline", data={"worker": False, "producer": False})
-        
-        # Robust parsing for different docker-compose versions
-        statuses = {"worker": False, "producer": False, "legacy": False}
+        # LOG FOR TRANSPARENCY: User will see this in their Terminal
+        full_command = ["docker", "compose", "-f", compose_file] + cmd_list
+        print(f"[DOCKER_CONTROL] Executing: {' '.join(full_command)}")
         
         try:
-            items = json.loads(raw)
-            if not isinstance(items, list): items = [items]
-        except:
-            # Fallback for line-separated JSON objects
-            items = []
-            for line in raw.split("\n"):
-                if line.strip():
-                    try: items.append(json.loads(line))
-                    except: pass
+            # Try Docker Compose V2 (Plugin)
+            result = subprocess.run(full_command, cwd=root_dir, capture_output=True, text=True, check=True)
+            return True, result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fallback to Docker Compose V1 (Hyphenated)
+            full_command_v1 = ["docker-compose", "-f", compose_file] + cmd_list
+            print(f"[DOCKER_CONTROL] V2 failed, trying V1: {' '.join(full_command_v1)}")
+            result = subprocess.run(full_command_v1, cwd=root_dir, capture_output=True, text=True, check=True)
+            return True, result.stdout.strip()
 
-        for item in items:
-            # Handle variations in 'docker-compose ps' output keys (Service vs Name)
-            service = item.get("Service") or item.get("Name", "")
-            state = item.get("State") or item.get("Status", "")
-            is_running = any(x in state.lower() for x in ["up", "running", "active"])
-            
-            # Lowercase for matching
-            s_low = service.lower()
-            if "worker"   in s_low: statuses["worker"]   = is_running
-            if "producer" in s_low: statuses["producer"] = is_running
-            if "legacy"   in s_low: statuses["legacy"]   = is_running
-            
-        return _ok("Status fetched", data=statuses)
     except Exception as e:
-        # Fallback if docker-compose is not reachable
-        return _err(f"Docker control error: {str(e)}")
+        error_msg = getattr(e, 'stderr', str(e))
+        print(f"[DOCKER_CONTROL] FAILED: {error_msg}")
+        return False, f"Docker CLI Error: {error_msg.strip()}"
+
+@app.route("/api/ops/service-status", methods=["GET"])
+def ops_service_status():
+    """Returns the running status of dockerized services using docker compose ps."""
+    statuses = {"worker": False, "producer": False, "legacy": False}
+    
+    for svc in statuses.keys():
+        # --status running -q returns the container ID if running, empty if not
+        success, output = run_docker_compose(["ps", svc, "--status", "running", "-q"])
+        if success and output:
+            statuses[svc] = True
+            
+    return _ok("Status fetched", data=statuses)
 
 
 @app.route("/api/ops/service-toggle", methods=["POST"])
 def ops_service_toggle():
     """Starts or stops a specific docker service."""
     body = request.get_json(silent=True) or {}
-    service_name = body.get("service") # "worker" or "producer"
+    service_name = body.get("service")
     action = body.get("action")       # "start" or "stop"
     
     if service_name not in ["worker", "producer", "legacy"]:
-        return _err("Invalid service name")
+        return _err("Dịch vụ không hợp lệ")
     
-    # Internal map to docker-compose service names
-    service_map = {"worker": "worker", "producer": "producer", "legacy": "legacy"}
-    target = service_map[service_name]
+    # Map 'start'/'stop' to docker compose commands
+    if action not in ["start", "stop", "restart"]:
+        return _err("Hành động không hợp lệ")
+
+    def run_toggle():
+        run_docker_compose([action, service_name])
     
-    try:
-        root_dir = os.path.dirname(os.path.dirname(__file__))
-        # Execute command in background thread to avoid timeout
-        def run_docker_task():
-            subprocess.run(["docker-compose", action, target], cwd=root_dir)
-        
-        threading.Thread(target=run_docker_task, daemon=True).start()
-        return _ok(f"Đã gửi lệnh {action} tới hệ thống {service_name}...")
-    except Exception as e:
-        return _err(str(e))
+    # Run in background to prevent UI block/timeout
+    threading.Thread(target=run_toggle, daemon=True).start()
+    
+    return _ok(f"Đã gửi lệnh {action} tới hệ thống {service_name}...")
 
 
 @app.route("/api/ops/wipe-databases", methods=["POST"])

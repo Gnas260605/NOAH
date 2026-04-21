@@ -135,13 +135,14 @@ def _local_worker_loop():
                     _local_queue.task_done()
 
 
-# Khởi động worker thread ngay khi module load
-try:
-    _worker_thread = threading.Thread(target=_local_worker_loop, daemon=True)
-    _worker_thread.start()
-    print("[Worker] High-performance background processor started successfully (Local Mode).")
-except Exception as e:
-    print(f"[Worker] FAILED TO START: {e}")
+# Start internal worker ONLY in Local Mode
+if LOCAL_MODE:
+    try:
+        _worker_thread = threading.Thread(target=_local_worker_loop, daemon=True)
+        _worker_thread.start()
+        print("[Worker] High-performance background processor started successfully (Local Mode).")
+    except Exception as e:
+        print(f"[Worker] FAILED TO START: {e}")
 
 
 def enqueue(data: dict):
@@ -274,12 +275,12 @@ def _fetch_pg_count() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-#  Snapshot cache (ttl 4s)
+#  Snapshot cache (ttl 1s)
 # ─────────────────────────────────────────────────────────────
 _snap_cache:  dict | None = None
 _snap_time:   float = 0
 _snap_lock    = threading.Lock()
-CACHE_TTL     = 4  # seconds
+CACHE_TTL     = 1  # seconds
 
 
 def build_snapshot(force: bool = False) -> dict:
