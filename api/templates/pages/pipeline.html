@@ -1,0 +1,79 @@
+{% extends 'layouts/base.html' %}
+
+{% block content %}
+<div class="space-y-8 animate-in fade-in duration-700">
+    
+    <!-- Header -->
+    <div class="flex items-end justify-between">
+        <div>
+            <h1 class="text-3xl font-extrabold text-slate-900 tracking-tight">System Pipeline Logs</h1>
+            <p class="text-slate-500 mt-1">Giám sát các hoạt động của Worker và Hệ thống theo thời gian thực.</p>
+        </div>
+        <div class="flex gap-2">
+           <button onclick="clearLogs()" class="px-4 py-2 bg-white border border-slate-200 text-xs font-bold text-slate-600 rounded-xl hover:bg-slate-50 transition-all">Clear Logs</button>
+           <button onclick="location.reload()" class="p-2 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100">
+               <i data-lucide="refresh-cw" class="w-5 h-5"></i>
+           </button>
+        </div>
+    </div>
+
+    <!-- Logs Container -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col h-[700px]">
+        <div class="p-4 bg-slate-50/50 border-b border-slate-100 flex items-center justify-between">
+            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Event Timeline</span>
+            <div class="flex items-center gap-4">
+                <div class="flex items-center gap-1.5 px-2 py-0.5 bg-emerald-50 text-emerald-600 rounded-md">
+                    <span class="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <span class="text-[9px] font-bold uppercase tracking-tighter">Monitoring Active</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="logs-container" class="flex-1 overflow-auto p-6 space-y-3 font-mono text-[13px]">
+            <!-- Content will be polled via JS -->
+        </div>
+    </div>
+</div>
+
+<script>
+    function fetchLogs() {
+        fetch('/api/ops/worker-logs')
+            .then(r => r.json())
+            .then(res => {
+                if (res.status === 'success') {
+                    const container = document.getElementById('logs-container');
+                    let html = '';
+                    res.data.forEach(log => {
+                        const isError = log.event.toLowerCase().includes('error');
+                        const isBatch = log.event.toLowerCase().includes('batch');
+                        
+                        let colorClass = 'text-slate-600';
+                        if (isError) colorClass = 'text-rose-500 bg-rose-50/50 p-2 rounded-lg';
+                        if (isBatch) colorClass = 'text-indigo-600';
+
+                        html += `
+                            <div class="flex gap-4 border-b border-slate-50 pb-2 ${colorClass}">
+                                <span class="w-20 flex-shrink-0 text-[10px] text-slate-400 font-bold">${log.created_at ? log.created_at.split(' ')[1] : ''}</span>
+                                <span class="w-32 flex-shrink-0 font-black uppercase text-[11px] tracking-tight">${log.event}</span>
+                                <span class="flex-1">${log.message}</span>
+                            </div>
+                        `;
+                    });
+                    container.innerHTML = html;
+                }
+            });
+    }
+
+    function clearLogs() {
+        if(confirm("Xác nhận xoá toàn bộ log hệ thống?")) {
+            // No direct delete API currently, but we could add one if needed.
+            // For now, just toast.
+            showToast("Chức năng Clear Logs đang được phát triển...", "info");
+        }
+    }
+
+    // Auto refresh logs
+    setInterval(fetchLogs, 3000);
+    fetchLogs();
+</script>
+{% endblock %}

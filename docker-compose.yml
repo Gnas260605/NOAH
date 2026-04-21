@@ -1,0 +1,214 @@
+##############################################################################
+#  NOAH Retail Integration System – Docker Compose
+#  Services: mysql · postgres · rabbitmq · kong-db · kong · api · worker · producer · legacy
+##############################################################################
+
+services:
+
+  # ── Kong Database (Postgres) ─────────────────────────────────────────────
+  kong-db:
+    image: postgres:14
+    container_name: noah-kong-db
+    environment:
+      POSTGRES_DB:       kong
+      POSTGRES_USER:     kong
+      POSTGRES_PASSWORD: kong
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U kong -d kong"]
+      interval: 5s
+      timeout:  5s
+      retries:  10
+    restart: unless-stopped
+
+  # ── Kong Migrations ───────────────────────────────────────────────────────
+  kong-migration:
+    image: kong:3.6
+    container_name: noah-kong-migration
+    command: kong migrations bootstrap
+    environment:
+      KONG_DATABASE:    postgres
+      KONG_PG_HOST:     kong-db
+      KONG_PG_USER:     kong
+      KONG_PG_PASSWORD: kong
+    depends_on:
+      kong-db:
+        condition: service_healthy
+    restart: on-failure
+
+  # ── Kong API Gateway ──────────────────────────────────────────────────────
+  kong:
+    image: kong:3.6
+    container_name: noah-kong
+    ports:
+      - "8000:8000"   # Proxy port (send requests through here)
+      - "8001:8001"   # Admin API (configure Kong)
+    environment:
+      KONG_DATABASE:           postgres
+      KONG_PG_HOST:            kong-db
+      KONG_PG_USER:            kong
+      KONG_PG_PASSWORD:        kong
+      KONG_PROXY_ACCESS_LOG:   /dev/stdout
+      KONG_ADMIN_ACCESS_LOG:   /dev/stdout
+      KONG_PROXY_ERROR_LOG:    /dev/stderr
+      KONG_ADMIN_ERROR_LOG:    /dev/stderr
+      KONG_ADMIN_LISTEN:       0.0.0.0:8001
+    depends_on:
+      kong-migration:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test:     ["CMD", "kong", "health"]
+      interval: 10s
+      timeout:  5s
+      retries:  10
+
+  # ── RabbitMQ Message Broker ───────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: noah-rabbitmq
+    ports:
+      - "5672:5672"     # AMQP port
+      - "15672:15672"   # Management UI  → http://localhost:15672 (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test:     ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout:  5s
+      retries:  15
+    restart: unless-stopped
+
+  # ── MySQL – E-Commerce Database ───────────────────────────────────────────
+  mysql:
+    image: mysql:8
+    container_name: noah-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE:      ecommerce
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./db/init_mysql.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:     ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -proot --silent"]
+      interval: 5s
+      timeout:  5s
+      retries:  20
+    restart: unless-stopped
+
+  # ── PostgreSQL – Finance Database ─────────────────────────────────────────
+  postgres:
+    image: postgres:14
+    container_name: noah-postgres
+    environment:
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB:       finance
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U postgres -d finance"]
+      interval: 5s
+      timeout:  5s
+      retries:  20
+    restart: unless-stopped
+
+  # ── Noah API (Flask + Gunicorn) ───────────────────────────────────────────
+  api:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: noah-api
+    ports:
+      - "5000:5000"
+    environment:
+      RABBITMQ_HOST:     rabbitmq
+      RABBITMQ_QUEUE:    orders
+      RABBITMQ_API_URL:  http://rabbitmq:15672/api
+      RABBITMQ_USER:     guest
+      RABBITMQ_PASSWORD: guest
+      MYSQL_HOST:        mysql
+      MYSQL_USER:        root
+      MYSQL_PASSWORD:    root
+      MYSQL_DATABASE:    ecommerce
+      POSTGRES_HOST:     postgres
+      POSTGRES_DB:       finance
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: root
+    volumes:
+      - noah_data:/app/data                      # SQLite persistence
+      - ./legacy/inventory.csv:/app/legacy/inventory.csv  # Historical CSV
+      - ./db/init.sql:/app/db/init.sql                     # Historical SQL
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  # ── Worker (RabbitMQ Consumer) ────────────────────────────────────────────
+  worker:
+    build:
+      context:    ./worker
+      dockerfile: Dockerfile
+    container_name: noah-worker
+    environment:
+      RABBITMQ_HOST:     rabbitmq
+      MYSQL_HOST:        mysql
+      MYSQL_USER:        root
+      MYSQL_PASSWORD:    root
+      MYSQL_DATABASE:    ecommerce
+      POSTGRES_HOST:     postgres
+      POSTGRES_DB:       finance
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: root
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  # ── Producer (Continuous Order Generator) ────────────────────────────────
+  producer:
+    build:
+      context:    ./producer
+      dockerfile: Dockerfile
+    container_name: noah-producer
+    environment:
+      RABBITMQ_HOST:  rabbitmq
+      RABBITMQ_QUEUE: orders
+      SEND_INTERVAL:  "1.0"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Legacy CSV Reader (stays alive for manual trigger) ────────────────────
+  legacy:
+    build:
+      context:    ./legacy
+      dockerfile: Dockerfile
+    container_name: noah-legacy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    volumes:
+      - ./legacy:/app
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: "no"
+
+##############################################################################
+volumes:
+  mysql_data:
+  postgres_data:
+  noah_data:
