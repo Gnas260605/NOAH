@@ -1,0 +1,195 @@
+##############################################################################
+#  NOAH Retail Integration System – Docker Compose
+#  Services: mysql · postgres · rabbitmq · kong-db · kong · api · worker · producer · legacy
+##############################################################################
+
+services:
+
+  # ── RabbitMQ Message Broker ───────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: noah-rabbitmq
+    ports:
+      - "5672:5672"     # AMQP port
+      - "15672:15672"   # Management UI  → http://localhost:15672 (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      TZ: Asia/Ho_Chi_Minh
+    healthcheck:
+      test:     ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout:  5s
+      retries:  15
+    restart: unless-stopped
+
+  # ── MySQL – E-Commerce Database ───────────────────────────────────────────
+  mysql:
+    image: mysql:8
+    container_name: noah-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE:      ecommerce
+      TZ:                  Asia/Ho_Chi_Minh
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./db/init_mysql.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:     ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -proot --silent"]
+      interval: 5s
+      timeout:  5s
+      retries:  20
+    restart: unless-stopped
+
+  # ── PostgreSQL – Finance Database ─────────────────────────────────────────
+  postgres:
+    image: postgres:14
+    container_name: noah-postgres
+    environment:
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB:       finance
+      TZ:                Asia/Ho_Chi_Minh
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U postgres -d finance"]
+      interval: 5s
+      timeout:  5s
+      retries:  20
+    restart: unless-stopped
+
+  # ── Noah API (Flask + Gunicorn) ───────────────────────────────────────────
+  api:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: noah-api
+    ports:
+      - "5005:5000"
+    environment:
+      RABBITMQ_HOST:     rabbitmq
+      RABBITMQ_QUEUE:    orders
+      RABBITMQ_API_URL:  http://rabbitmq:15672/api
+      RABBITMQ_USER:     guest
+      RABBITMQ_PASSWORD: guest
+      MYSQL_HOST:        mysql
+      MYSQL_USER:        root
+      MYSQL_PASSWORD:    root
+      MYSQL_DATABASE:    ecommerce
+      POSTGRES_HOST:     postgres
+      POSTGRES_DB:       finance
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: root
+      ENVIRONMENT:       docker
+      TZ:                Asia/Ho_Chi_Minh
+    volumes:
+      - noah_data:/app/data                      # SQLite persistence
+      - ./legacy/inventory.csv:/app/legacy/inventory.csv  # Historical CSV
+      - ./db/init.sql:/app/db/init.sql                     # Historical SQL
+      - /var/run/docker.sock:/var/run/docker.sock          # Access to Docker daemon
+      - ./docker-compose.yml:/app/docker-compose.yml:ro    # Compose context
+      - ./worker:/app/worker                               # Access to auto_healer module
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  # ── Worker (RabbitMQ Consumer) ────────────────────────────────────────────
+  worker:
+    build:
+      context:    ./worker
+      dockerfile: Dockerfile
+    container_name: noah-worker
+    environment:
+      RABBITMQ_HOST:     rabbitmq
+      MYSQL_HOST:        mysql
+      MYSQL_USER:        root
+      MYSQL_PASSWORD:    root
+      MYSQL_DATABASE:    ecommerce
+      POSTGRES_HOST:     postgres
+      POSTGRES_DB:       finance
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: root
+      ENVIRONMENT:       docker
+      TZ:                Asia/Ho_Chi_Minh
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  # ── Producer (Continuous Order Generator) ────────────────────────────────
+  producer:
+    build:
+      context:    ./producer
+      dockerfile: Dockerfile
+    container_name: noah-producer
+    environment:
+      RABBITMQ_HOST:  rabbitmq
+      RABBITMQ_QUEUE: orders
+      SEND_INTERVAL:  "1.0"
+      TZ:             Asia/Ho_Chi_Minh
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Legacy CSV Reader (stays alive for manual trigger) ────────────────────
+  legacy:
+    build:
+      context:    ./legacy
+      dockerfile: Dockerfile
+    container_name: noah-legacy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      TZ:            Asia/Ho_Chi_Minh
+    volumes:
+      - ./legacy:/app
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: "no"
+
+
+  # ── Auto-Healer (Module 2: Messaging & Consistency) ──────────────────────
+  auto_healer:
+    build:
+      context:    ./worker
+      dockerfile: Dockerfile.healer
+    container_name: noah-auto-healer
+    environment:
+      MYSQL_HOST:             mysql
+      MYSQL_USER:             root
+      MYSQL_PASSWORD:         root
+      MYSQL_DATABASE:         ecommerce
+      POSTGRES_HOST:          postgres
+      POSTGRES_DB:            finance
+      POSTGRES_USER:          postgres
+      POSTGRES_PASSWORD:      root
+      HEAL_INTERVAL_SECONDS:  "60"   # chạy heal mỗi 60 giây
+      HEAL_BATCH_LIMIT:       "500"  # tối đa 500 bản ghi mỗi chu kỳ
+      TZ:                     Asia/Ho_Chi_Minh
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
+
+##############################################################################
+volumes:
+  mysql_data:
+  postgres_data:
+  noah_data:
