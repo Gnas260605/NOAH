@@ -38,11 +38,14 @@ from api.services import (
     ingest_sql,
     wipe_all,
     purge_queue,
+    run_auto_heal,
+    get_heal_history,
+    get_heal_summary,
+    fetch_dirty_records,
 )
 from api.db_local import (
-    get_tables, query_table, 
-    get_system_logs, get_dirty_records,
-    log_event as _log_event
+    get_tables, query_table,
+    get_system_logs, log_event as _log_event
 )
 
 app = Flask(__name__)
@@ -153,7 +156,7 @@ def report_page():
     synced_pct     = round(min(mysql_count, postgres_count) / max_c * 100, 1)
 
     # Lấy dữ liệu bẩn thực tế
-    dirty_records = get_dirty_records(100)
+    dirty_records = fetch_dirty_records(100)
     
     # Tính toán thống kê lỗi (Top issues)
     issue_counts = {}
@@ -198,6 +201,8 @@ def report_data():
     max_c          = max(mysql_count, postgres_count, 1)
     synced_pct     = round(min(mysql_count, postgres_count) / max_c * 100, 1)
     
+    dirty_records = fetch_dirty_records(100)
+    
     data = {
         "generated_at":   snap["generated_at"],
         "status":         "OK" if diff == 0 else "MISMATCH",
@@ -205,7 +210,7 @@ def report_data():
         "postgres_count": postgres_count,
         "diff":           diff,
         "dlq_count":      0,
-        "dirty_log":      [],
+        "dirty_log":      dirty_records,
         "reconciliation": {
             "synced_pct": synced_pct,
             "result":     f"Orders DB={mysql_count}, Finance DB={postgres_count}, Diff={diff}",
@@ -483,7 +488,49 @@ def api_worker_logs():
 
 @app.route("/api/ops/dirty-data")
 def api_dirty_data():
-    return _ok("Dirty data loaded", get_dirty_records(100))
+    return _ok("Dirty data loaded", fetch_dirty_records(100))
+
+
+# ─────────────────────────────────────────────────────────────
+#  Module 2: Auto-Healing API
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/api/ops/auto-heal", methods=["POST"])
+def api_auto_heal():
+    """Kích hoạt một chu kỳ auto-heal ngay lập tức."""
+    try:
+        result = run_auto_heal()
+        status = result.get("status", "ok")
+        if status == "error":
+            return _err(f"Heal thất bại: {result.get('error', 'unknown')}", result)
+        msg = (
+            f"Heal hoàn tất: phát hiện {result.get('total_diff',0)} lệch, "
+            f"đã sửa {result.get('total_healed',0)} bản ghi, "
+            f"{result.get('errors',0)} lỗi."
+        )
+        return _ok(msg, result)
+    except Exception as e:
+        return _err(f"Lỗi auto-heal: {e}")
+
+
+@app.route("/api/ops/heal-log", methods=["GET"])
+def api_heal_log():
+    """Lịch sử các chu kỳ heal gần nhất."""
+    limit = min(int(request.args.get("limit", 20)), 100)
+    history = get_heal_history(limit)
+    summary = get_heal_summary()
+    return _ok("Heal log loaded", {"summary": summary, "history": history})
+
+
+@app.route("/api/ops/heal-status", methods=["GET"])
+def api_heal_status():
+    """Trạng thái tổng hợp của hệ thống heal."""
+    summary = get_heal_summary()
+    snap = build_snapshot()
+    diff = abs(snap["mysql"]["count"] - snap["postgres"]["count"])
+    summary["current_diff"] = diff
+    summary["needs_heal"] = diff > 0
+    return _ok("Heal status", summary)
 
 
 if __name__ == "__main__":

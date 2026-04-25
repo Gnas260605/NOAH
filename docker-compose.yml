@@ -70,7 +70,7 @@ services:
       dockerfile: Dockerfile
     container_name: noah-api
     ports:
-      - "5000:5000"
+      - "5005:5000"
     environment:
       RABBITMQ_HOST:     rabbitmq
       RABBITMQ_QUEUE:    orders
@@ -93,6 +93,7 @@ services:
       - ./db/init.sql:/app/db/init.sql                     # Historical SQL
       - /var/run/docker.sock:/var/run/docker.sock          # Access to Docker daemon
       - ./docker-compose.yml:/app/docker-compose.yml:ro    # Compose context
+      - ./worker:/app/worker                               # Access to auto_healer module
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -160,6 +161,32 @@ services:
       rabbitmq:
         condition: service_healthy
     restart: "no"
+
+
+  # ── Auto-Healer (Module 2: Messaging & Consistency) ──────────────────────
+  auto_healer:
+    build:
+      context:    ./worker
+      dockerfile: Dockerfile.healer
+    container_name: noah-auto-healer
+    environment:
+      MYSQL_HOST:             mysql
+      MYSQL_USER:             root
+      MYSQL_PASSWORD:         root
+      MYSQL_DATABASE:         ecommerce
+      POSTGRES_HOST:          postgres
+      POSTGRES_DB:            finance
+      POSTGRES_USER:          postgres
+      POSTGRES_PASSWORD:      root
+      HEAL_INTERVAL_SECONDS:  "60"   # chạy heal mỗi 60 giây
+      HEAL_BATCH_LIMIT:       "500"  # tối đa 500 bản ghi mỗi chu kỳ
+      TZ:                     Asia/Ho_Chi_Minh
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: always
 
 ##############################################################################
 volumes:

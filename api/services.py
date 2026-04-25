@@ -22,13 +22,18 @@ from api.config import (
     MYSQL_CONFIG, POSTGRES_CONFIG,
 )
 from api.db_local import (
-    insert_order      as _sqlite_insert,
-    insert_orders_bulk as _sqlite_bulk,
-    get_recent_orders as _sqlite_recent,
-    count_orders      as _sqlite_count,
-    truncate_orders   as _sqlite_truncate,
-    log_event         as _log_event,
-    log_dirty         as _log_dirty,
+    insert_order        as _sqlite_insert,
+    insert_orders_bulk  as _sqlite_bulk,
+    get_recent_orders   as _sqlite_recent,
+    count_orders        as _sqlite_count,
+    truncate_orders     as _sqlite_truncate,
+    log_event           as _log_event,
+    log_dirty           as _log_dirty,
+    log_heal_cycle      as _log_heal_cycle,
+    get_heal_log        as _get_heal_log,
+    get_heal_stats      as _get_heal_stats_db,
+    simulate_local_heal as _simulate_local_heal,
+    get_dirty_records   as _sqlite_get_dirty_records,
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -254,6 +259,28 @@ def _fetch_orders() -> dict:
         return {"ok": True, "rows": rows, "total": total}
     except Exception:
         return {"ok": False, "rows": [], "total": 0}
+
+
+def fetch_dirty_records(limit: int = 100) -> list:
+    """Lấy danh sách dữ liệu bẩn từ MySQL (Docker) hoặc SQLite (local)."""
+    if LOCAL_MODE:
+        return _sqlite_get_dirty_records(limit)
+
+    try:
+        import mysql.connector
+        conn = mysql.connector.connect(**MYSQL_CONFIG)
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id, transaction_id as source, reason, raw_payload as payload, created_at "
+            "FROM dirty_log ORDER BY id DESC LIMIT %s", (limit,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"fetch_dirty_records error: {e}")
+        return []
 
 
 def _fetch_pg_count() -> dict:
@@ -545,3 +572,98 @@ def purge_queue() -> dict:
         return {"status": "success", "message": "Pipeline purged successfully."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────
+#  Module 2: Auto-Healing – Messaging & Consistency
+# ─────────────────────────────────────────────────────────────
+
+def run_auto_heal() -> dict:
+    """
+    Kích hoạt một chu kỳ auto-heal.
+
+    • LOCAL MODE  : giả lập heal (kiểm tra/sửa dữ liệu bị thiếu trường)
+    • DOCKER MODE : chạy HealEngine thực sự (MySQL ↔ PostgreSQL diff + patch)
+
+    Returns: dict kết quả chu kỳ (cùng schema với HealEngine.run_cycle)
+    """
+    if LOCAL_MODE:
+        result = _simulate_local_heal()
+        _log_event("AutoHeal", f"Local heal: {result.get('total_healed',0)} bản ghi đã sửa.")
+        return result
+
+    # Docker mode – import engine
+    try:
+        import sys, os
+        import json
+        from api.db_local import _get_conn, _lock
+        # Đảm bảo worker/ trong path
+        worker_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "worker")
+        if worker_dir not in sys.path:
+            sys.path.insert(0, worker_dir)
+
+        from auto_healer import HealEngine
+        engine = HealEngine()
+        engine.connect()
+        result = engine.run_cycle()
+        engine.close()
+
+        # Ghi vào DB
+        _log_heal_cycle(result)
+        _log_event(
+            "AutoHeal",
+            f"Detected={result.get('total_diff',0)}, "
+            f"Healed={result.get('total_healed',0)}, "
+            f"Errors={result.get('errors',0)}"
+        )
+        
+        # Save auto-heal result directly into heal_log table as requested
+        with _lock:
+            conn = _get_conn()
+            try:
+                conn.execute(
+                    """INSERT INTO heal_log
+                       (cycle_started, cycle_finished, detected,
+                        healed_pg, healed_mysql, errors, status, detail_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        result.get("started_at", ""),
+                        result.get("finished_at", ""),
+                        result.get("total_diff", 0),
+                        result.get("healed_into_pg", 0),
+                        result.get("healed_into_mysql", 0),
+                        result.get("errors", 0),
+                        result.get("status", "ok"),
+                        json.dumps(result.get("details", [])[:50])
+                    )
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"[run_auto_heal] log error: {e}")
+            finally:
+                conn.close()
+
+        return result
+
+    except Exception as e:
+        err = {"status": "error", "error": str(e), "total_diff": 0, "total_healed": 0}
+        _log_event("AutoHeal Error", str(e))
+        return err
+
+
+def get_heal_history(limit: int = 20) -> list:
+    """Trả về lịch sử các chu kỳ heal từ SQLite (local) hoặc từ in-memory (docker)."""
+    return _get_heal_log(limit)
+
+
+def get_heal_summary() -> dict:
+    """Trả về tổng hợp thống kê heal."""
+    db_stats = _get_heal_stats_db()
+    return {
+        "cycles":              db_stats.get("cycles", 0),
+        "total_detected":      db_stats.get("total_detected", 0),
+        "total_healed_pg":     db_stats.get("total_healed_pg", 0),
+        "total_healed_mysql":  db_stats.get("total_healed_mysql", 0),
+        "total_errors":        db_stats.get("total_errors", 0),
+        "last_run":            db_stats.get("last_run", "Chưa chạy"),
+    }
