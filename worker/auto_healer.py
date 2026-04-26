@@ -8,7 +8,7 @@ Luồng hoạt động:
   1. DETECT  – So sánh message_id tồn tại ở hai DB
   2. DIAGNOSE – Phân loại: thiếu ở PG, thiếu ở MySQL, hay conflict
   3. HEAL    – Sao chép bản ghi bị thiếu sang DB đích
-  4. AUDIT   – Ghi nhật ký toàn bộ hành động heal
+  4. AUDIT   – Ghi nhật ký toàn bộ hành động heal .
 
 Có thể chạy:
   • Độc lập:  python auto_healer.py
